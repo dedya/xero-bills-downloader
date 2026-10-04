@@ -1,0 +1,438 @@
+/**
+ * Service_Xero.gs
+ * Purpose: Everything that talks to Xero: OAuth2 services per entity,
+ *          connect / disconnect, the shared fetch wrapper with rate-limit,
+ *          401 and 5xx handling, and the bills / attachments endpoints.
+ * Depends on: Config.gs, Utils.gs, Service_Control.gs, OAuth2 library
+ * Last updated: 2026-10-02 (tenant check)
+ */
+
+/**
+ * Builds the OAuth2 service for one entity. Tokens are stored in Script
+ * Properties so time-driven triggers can use them.
+ * @param {string} entity - Entity key.
+ * @return {OAuth2.Service} OAuth2 service.
+ * @throws {Error} If the client ID / secret Script Properties are missing.
+ */
+function getXeroService_(entity) {
+  const clientId = getXeroClientId_(entity);
+  const clientSecret = getXeroClientSecret_(entity);
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      `Set ${PROP_KEYS.CLIENT_ID} and ${PROP_KEYS.CLIENT_SECRET} in Project Settings > Script Properties.`,
+    );
+  }
+  return OAuth2.createService(XERO.SERVICE_PREFIX + entity)
+    .setAuthorizationBaseUrl(XERO.AUTHORIZE_URL)
+    .setTokenUrl(XERO.TOKEN_URL)
+    .setClientId(clientId)
+    .setClientSecret(clientSecret)
+    .setScope(XERO.SCOPES)
+    .setCallbackFunction("authCallback")
+    .setPropertyStore(PropertiesService.getScriptProperties())
+    .setCache(CacheService.getScriptCache())
+    .setLock(LockService.getUserLock()); // serialises refresh-token rotation
+}
+
+/**
+ * Returns the redirect URI to register on the Xero app.
+ * @return {string} Redirect URI.
+ */
+function getXeroRedirectUri_() {
+  return OAuth2.getRedirectUri();
+}
+
+/**
+ * Builds the dialog that sends the user to Xero's consent screen.
+ * @param {string} entity - Entity key.
+ * @return {GoogleAppsScript.HTML.HtmlOutput} Dialog content.
+ * @throws {Error} If the entity isn't on the Entities sheet.
+ */
+function buildConnectDialog_(entity) {
+  if (!getEntity_(entity))
+    throw new Error(`Add '${entity}' to the Entities sheet first.`);
+  const url = getXeroService_(entity).getAuthorizationUrl({ entity: entity });
+  return HtmlService.createHtmlOutput(
+    `<div style="font-family:Arial;font-size:13px">` +
+      `<p><a href="${escapeHtml_(url)}" target="_blank">Open Xero to authorise ${escapeHtml_(entity)}</a></p>` +
+      `<p>Choose the organisation for <b>${escapeHtml_(entity)}</b>, then close this dialog. ` +
+      `The Entities sheet shows the result.</p></div>`,
+  )
+    .setWidth(420)
+    .setHeight(140);
+}
+
+/**
+ * Handles Xero's redirect after consent: stores tokens, then the tenant ID.
+ * @param {Object} request - Callback request from the OAuth2 library.
+ * @return {GoogleAppsScript.HTML.HtmlOutput} Page shown in the browser tab.
+ */
+function handleXeroAuthCallback_(request) {
+  const entity = String(request.parameter.entity || "").toUpperCase();
+  const service = getXeroService_(entity);
+  const message = service.handleCallback(request)
+    ? resolveEntityTenant_(entity, service)
+    : `Authorisation for ${entity} was cancelled or denied.`;
+  return HtmlService.createHtmlOutput(
+    `<div style="font-family:Arial;font-size:14px;white-space:pre-wrap">${escapeHtml_(message)}</div>`,
+  );
+}
+
+/**
+ * Menu helper: re-reads the organisations an entity's saved token can reach and
+ * fills in its Tenant ID, without going through Xero consent again.
+ * @param {string} entity - Entity key.
+ * @return {string} Result message for the user.
+ * @throws {Error} If the entity has no usable token.
+ */
+function refreshEntityTenant_(entity) {
+  if (!getEntity_(entity))
+    throw new Error(`Entity '${entity}' is not on the Entities sheet.`);
+  const service = getXeroService_(entity);
+  if (!service.hasAccess()) {
+    throw new Error(
+      `${entity} has no valid Xero token yet. Use Xero Bills > Connect entity first.`,
+    );
+  }
+  return resolveEntityTenant_(entity, service);
+}
+
+/**
+ * Matches the entity to one of the token's Xero organisations and writes the
+ * Tenant ID (or the reason it couldn't) to the Entities sheet.
+ * @param {string} entity - Entity key.
+ * @param {OAuth2.Service} service - Authorised service.
+ * @return {string} Result message for the user.
+ */
+function resolveEntityTenant_(entity, service) {
+  const connections = fetchXeroConnections_(service);
+  logInfo_(
+    "resolveEntityTenant_",
+    `${entity}: ${connections.length} connection(s): ` +
+      connections.map((c) => c.tenantName).join(", "),
+  );
+
+  if (!connections.length) {
+    updateEntity_(entity, {
+      TENANT_ID: "",
+      STATUS: ENTITY_STATUS.CHOOSE_TENANT,
+    });
+    return (
+      `${entity}: the token works, but no Xero organisation was ticked on the consent screen. ` +
+      "Run Connect entity again and tick the organisation."
+    );
+  }
+
+  const tenant = chooseXeroTenant_(getEntity_(entity), connections);
+  if (!tenant) {
+    updateEntity_(entity, {
+      TENANT_ID: "",
+      STATUS: ENTITY_STATUS.CHOOSE_TENANT,
+    });
+    const list = connections
+      .map((c) => `- ${c.tenantName}  (${c.tenantId})`)
+      .join("\n");
+    return (
+      `${entity}: ${connections.length} organisations are connected, so I can't tell which one is ${entity}.\n\n` +
+      `Paste the right name into Tenant Name (or the ID into Tenant ID) on the Entities sheet, ` +
+      `then run Xero Bills > Check connection:\n\n${list}`
+    );
+  }
+
+  updateEntity_(entity, {
+    TENANT_NAME: tenant.tenantName,
+    TENANT_ID: tenant.tenantId,
+    STATUS: ENTITY_STATUS.CONNECTED,
+  });
+  return `${entity} is connected to ${tenant.tenantName} (tenant ID ${tenant.tenantId}). You can close this tab.`;
+}
+
+/**
+ * Lists the Xero organisations this service's token can reach.
+ * @param {OAuth2.Service} service - Authorised service.
+ * @return {Array<Object>} Connections ({id, tenantId, tenantName, …}).
+ * @throws {Error} On a non-200 response.
+ */
+function fetchXeroConnections_(service) {
+  const resp = UrlFetchApp.fetch(XERO.CONNECTIONS_URL, {
+    headers: {
+      Authorization: "Bearer " + service.getAccessToken(),
+      Accept: "application/json",
+    },
+    muteHttpExceptions: true,
+  });
+  if (resp.getResponseCode() !== 200) {
+    throw new Error(
+      `Xero /connections returned ${resp.getResponseCode()}: ${resp.getContentText().slice(0, 300)}`,
+    );
+  }
+  return JSON.parse(resp.getContentText()).filter(
+    (c) => c.tenantType === "ORGANISATION" || !c.tenantType,
+  );
+}
+
+/**
+ * Picks this entity's organisation: saved tenant ID, then Tenant Name, then
+ * the only connection if there's just one.
+ * @param {Object} entityRecord - Row from getEntity_().
+ * @param {Array<Object>} connections - Xero connections.
+ * @return {Object|null} Chosen connection, or null if ambiguous.
+ */
+function chooseXeroTenant_(entityRecord, connections) {
+  if (entityRecord.tenantId) {
+    const byId = connections.find((c) => c.tenantId === entityRecord.tenantId);
+    if (byId) return byId;
+  }
+  if (entityRecord.tenantName) {
+    const byName = connections.find(
+      (c) => normalise_(c.tenantName) === normalise_(entityRecord.tenantName),
+    );
+    if (byName) return byName;
+  }
+  return connections.length === 1 ? connections[0] : null;
+}
+
+/**
+ * Removes this entity's organisation connection at Xero, then forgets the
+ * tokens locally. Only this organisation is disconnected; others stay.
+ * @param {string} entity - Entity key.
+ * @return {string} Result message for the user.
+ * @throws {Error} If Xero refuses the disconnect (local tokens are kept).
+ */
+function disconnectXeroEntity_(entity) {
+  const record = getEntity_(entity);
+  if (!record)
+    throw new Error(`Entity '${entity}' is not on the Entities sheet.`);
+  const service = getXeroService_(entity);
+  let message;
+
+  if (service.hasAccess() && record.tenantId) {
+    const match = fetchXeroConnections_(service).find(
+      (c) => c.tenantId === record.tenantId,
+    );
+    if (match) {
+      const resp = UrlFetchApp.fetch(`${XERO.CONNECTIONS_URL}/${match.id}`, {
+        method: "delete",
+        headers: { Authorization: "Bearer " + service.getAccessToken() },
+        muteHttpExceptions: true,
+      });
+      const code = resp.getResponseCode();
+      if (code !== 204 && code !== 200) {
+        throw new Error(
+          `Xero refused the disconnect (${code}). Nothing was changed locally.`,
+        );
+      }
+      message = `${entity} disconnected from ${match.tenantName} at Xero.`;
+    } else {
+      message = `${entity}'s organisation was already disconnected at Xero.`;
+    }
+  } else {
+    message =
+      `No valid token for ${entity}, so Xero couldn't be told. Disconnect it in Xero ` +
+      `(Settings > Connected apps) to be sure.`;
+  }
+
+  service.reset();
+  updateEntity_(entity, { TENANT_ID: "", STATUS: ENTITY_STATUS.DISCONNECTED });
+  return message;
+}
+
+/**
+ * Throws unless an entity is on the Entities sheet with a tenant and a usable token.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @throws {Error} With a user-readable reason.
+ */
+function requireConnectedEntity_(ctx, entity) {
+  const record = getEntity_(entity);
+  if (!record)
+    throw new Error(`Entity '${entity}' is not on the Entities sheet.`);
+  if (!record.tenantId)
+    throw new Error(
+      `${entity} isn't connected. Use Xero Bills > Connect entity.`,
+    );
+  if (!getRunService_(ctx, entity).hasAccess()) {
+    throw new Error(
+      `${entity}'s Xero token has expired or was revoked. Use Xero Bills > Connect entity again.`,
+    );
+  }
+  ctx.tenantIds[entity] = record.tenantId;
+}
+
+/**
+ * Returns a cached OAuth2 service for this run.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @return {OAuth2.Service} Service.
+ */
+function getRunService_(ctx, entity) {
+  if (!ctx.services[entity]) ctx.services[entity] = getXeroService_(entity);
+  return ctx.services[entity];
+}
+
+/**
+ * Returns the tenant ID for this run, reading the Entities sheet once.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @return {string} Tenant ID.
+ * @throws {Error} If the entity isn't connected.
+ */
+function getRunTenantId_(ctx, entity) {
+  if (!ctx.tenantIds[entity]) {
+    const record = getEntity_(entity);
+    if (!record || !record.tenantId)
+      throw new Error(
+        `${entity} isn't connected. Use Xero Bills > Connect entity.`,
+      );
+    ctx.tenantIds[entity] = record.tenantId;
+  }
+  return ctx.tenantIds[entity];
+}
+
+/**
+ * Calls the Xero Accounting API with rate limiting and bounded retries.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @param {string} path - Path after API_BASE, including any query string.
+ * @param {string=} accept - Accept header (default application/json).
+ * @return {GoogleAppsScript.URL_Fetch.HTTPResponse} Successful response.
+ * @throws {DailyLimitError|RetryLaterError|Error} On limits, time budget or failures.
+ */
+function fetchXero_(ctx, entity, path, accept) {
+  const service = getRunService_(ctx, entity);
+  const tenantId = getRunTenantId_(ctx, entity);
+  let retries401 = 0;
+  let retries429 = 0;
+  let retries5xx = 0;
+
+  while (true) {
+    waitForRateLimit_(ctx, entity);
+    const resp = UrlFetchApp.fetch(XERO.API_BASE + path, {
+      method: "get",
+      headers: {
+        Authorization: "Bearer " + service.getAccessToken(),
+        "Xero-tenant-id": tenantId,
+        Accept: accept || "application/json",
+      },
+      muteHttpExceptions: true,
+    });
+    const code = resp.getResponseCode();
+    if (code >= 200 && code < 300) return resp;
+
+    if (code === 429) {
+      const headers = lowerCaseHeaders_(resp);
+      const retryAfter = Number(headers["retry-after"] || 60);
+      if (
+        String(headers["x-rate-limit-problem"] || "").toLowerCase() === "day"
+      ) {
+        throw new DailyLimitError(
+          entity,
+          retryAfter || XERO.DEFAULT_DAILY_PAUSE_SECONDS,
+        );
+      }
+      retries429 += 1;
+      if (retries429 > XERO.MAX_429_RETRIES)
+        throw new Error(
+          `Gave up after ${XERO.MAX_429_RETRIES} rate-limit retries.`,
+        );
+      if ((retryAfter + 1) * 1000 > getRemainingMs_(ctx)) {
+        throw new RetryLaterError(
+          "Xero asked to wait longer than this run has left.",
+        );
+      }
+      Utilities.sleep((retryAfter + 1) * 1000);
+      continue;
+    }
+
+    if (code === 401) {
+      retries401 += 1;
+      if (retries401 > XERO.MAX_401_RETRIES) {
+        throw new Error(
+          "Xero returned 401 even after refreshing the token. Reconnect the entity " +
+            "(and check the app still has the 'accounting.attachments' scope).",
+        );
+      }
+      service.refresh();
+      continue;
+    }
+
+    if (code === 403) {
+      throw new Error(
+        "Xero returned 403 Forbidden. The consent is probably missing the 'accounting.attachments' " +
+          "scope: enable it on the Xero app and reconnect the entity.",
+      );
+    }
+
+    if (code >= 500 && retries5xx < XERO.MAX_5XX_RETRIES) {
+      retries5xx += 1;
+      Utilities.sleep(2000 * retries5xx);
+      continue;
+    }
+
+    throw new Error(
+      `Xero ${code} on ${path.split("?")[0]}: ${resp.getContentText().slice(0, 300)}`,
+    );
+  }
+}
+
+/**
+ * Returns response headers with lower-case keys.
+ * @param {GoogleAppsScript.URL_Fetch.HTTPResponse} resp - Response.
+ * @return {Object} Headers.
+ */
+function lowerCaseHeaders_(resp) {
+  const headers = resp.getHeaders();
+  return Object.keys(headers).reduce((out, key) => {
+    out[key.toLowerCase()] = headers[key];
+    return out;
+  }, {});
+}
+
+/**
+ * Fetches one page (up to 100) of ACCPAY invoices, oldest first.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @param {string} whereClause - Xero where filter.
+ * @param {number} page - 1-based page number.
+ * @return {Array<Object>} Xero invoices.
+ */
+function fetchBillsPage_(ctx, entity, whereClause, page) {
+  const query =
+    `?where=${encodeURIComponent(whereClause)}` +
+    `&order=${encodeURIComponent("Date ASC")}` +
+    `&page=${page}`;
+  const resp = fetchXero_(ctx, entity, "/Invoices" + query);
+  ctx.stats.billPages += 1;
+  return JSON.parse(resp.getContentText()).Invoices || [];
+}
+
+/**
+ * Lists the attachments on one bill.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @param {string} invoiceId - Xero InvoiceID.
+ * @return {Array<Object>} Attachments ({AttachmentID, FileName, MimeType, ContentLength}).
+ */
+function listInvoiceAttachments_(ctx, entity, invoiceId) {
+  const resp = fetchXero_(ctx, entity, `/Invoices/${invoiceId}/Attachments`);
+  return JSON.parse(resp.getContentText()).Attachments || [];
+}
+
+/**
+ * Downloads one attachment's content.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key.
+ * @param {string} invoiceId - Xero InvoiceID.
+ * @param {Object} attachment - Attachment from listInvoiceAttachments_().
+ * @return {GoogleAppsScript.Base.Blob} File content.
+ */
+function downloadInvoiceAttachment_(ctx, entity, invoiceId, attachment) {
+  const resp = fetchXero_(
+    ctx,
+    entity,
+    `/Invoices/${invoiceId}/Attachments/${attachment.AttachmentID}`,
+    attachment.MimeType || "*/*",
+  );
+  ctx.stats.filesDownloaded += 1;
+  return resp.getBlob();
+}

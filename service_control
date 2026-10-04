@@ -1,0 +1,211 @@
+/**
+ * Service_Control.gs
+ * Purpose: The control spreadsheet: building the Jobs and Entities sheets,
+ *          reading queued jobs, and writing job / entity status back.
+ * Depends on: Config.gs, Utils.gs
+ * Last updated: 2026-10-02
+ */
+
+/**
+ * Returns the control spreadsheet. Falls back to the saved ID when there is
+ * no active spreadsheet (e.g. inside the OAuth callback).
+ * @return {GoogleAppsScript.Spreadsheet.Spreadsheet} Control spreadsheet.
+ * @throws {Error} If the control spreadsheet can't be found.
+ */
+function getControlSpreadsheet_() {
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  if (active) {
+    if (props.getProperty(PROP_KEYS.CONTROL_SPREADSHEET_ID) !== active.getId()) {
+      props.setProperty(PROP_KEYS.CONTROL_SPREADSHEET_ID, active.getId());
+    }
+    return active;
+  }
+  const savedId = props.getProperty(PROP_KEYS.CONTROL_SPREADSHEET_ID);
+  if (!savedId) throw new Error('Control spreadsheet unknown. Open it and run Xero Bills > Set up sheets.');
+  return SpreadsheetApp.openById(savedId);
+}
+
+/**
+ * Returns a control sheet by name.
+ * @param {string} name - Sheet name from CONTROL_SHEET_NAMES.
+ * @return {GoogleAppsScript.Spreadsheet.Sheet} Sheet.
+ * @throws {Error} If the sheet is missing.
+ */
+function getControlSheet_(name) {
+  const sheet = getControlSpreadsheet_().getSheetByName(name);
+  if (!sheet) throw new Error(`Sheet '${name}' not found. Run Xero Bills > Set up sheets.`);
+  return sheet;
+}
+
+/**
+ * Creates or repairs the Entities and Jobs sheets and the Drive folders.
+ * Safe to run repeatedly; existing rows are kept.
+ */
+function setupControlSheets_() {
+  const ss = getControlSpreadsheet_();
+
+  const entitiesSheet = ss.getSheetByName(CONTROL_SHEET_NAMES.ENTITIES) || ss.insertSheet(CONTROL_SHEET_NAMES.ENTITIES);
+  applyStandardLayout_(entitiesSheet, ENTITY_HEADERS, ENTITY_COLUMN_WIDTHS);
+  if (entitiesSheet.getLastRow() < 2) {
+    entitiesSheet
+      .getRange(2, ENTITY_COL.ENTITY, DEFAULT_ENTITIES.length, 1)
+      .setValues(DEFAULT_ENTITIES.map((entity) => [entity]));
+  }
+  entitiesSheet
+    .getRange(1, ENTITY_COL.TENANT_NAME)
+    .setNote('Exact Xero organisation name. Needed only if you tick more than one organisation on the Xero consent screen.');
+  entitiesSheet.getRange(2, ENTITY_COL.UPDATED, entitiesSheet.getMaxRows() - 1, 1).setNumberFormat('yyyy-mm-dd hh:mm');
+
+  const jobsSheet = ss.getSheetByName(CONTROL_SHEET_NAMES.JOBS) || ss.insertSheet(CONTROL_SHEET_NAMES.JOBS, 0);
+  applyStandardLayout_(jobsSheet, JOB_HEADERS, JOB_COLUMN_WIDTHS);
+  applyJobsSheetRules_(jobsSheet, entitiesSheet);
+
+  getWorkFolders_();
+}
+
+/**
+ * Adds dropdowns, formats and header notes to the Jobs sheet.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} jobsSheet - Jobs sheet.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} entitiesSheet - Entities sheet (dropdown source).
+ */
+function applyJobsSheetRules_(jobsSheet, entitiesSheet) {
+  const bodyRows = jobsSheet.getMaxRows() - 1;
+  const column = (col) => jobsSheet.getRange(2, col, bodyRows, 1);
+
+  column(JOB_COL.ENTITY).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInRange(entitiesSheet.getRange('A2:A'), true)
+      .setAllowInvalid(false)
+      .build()
+  );
+  column(JOB_COL.PERIOD).setNumberFormat('@');
+  [JOB_COL.DATE_FROM, JOB_COL.DATE_TO].forEach((col) =>
+    column(col)
+      .setNumberFormat('yyyy-mm-dd')
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).build())
+  );
+  column(JOB_COL.STATUS).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(Object.values(JOB_STATUS), true)
+      .setAllowInvalid(false)
+      .build()
+  );
+  column(JOB_COL.LAST_UPDATED).setNumberFormat('yyyy-mm-dd hh:mm');
+  jobsSheet.hideColumns(JOB_COL.FILE_ID, 2);
+
+  jobsSheet.getRange(1, JOB_COL.PERIOD).setNote(
+    'YYYY (e.g. 2026) or YYYY-MM (e.g. 2026-03).\nLeave blank to use Date From / Date To.\nLeave all three blank for every bill.'
+  );
+  jobsSheet.getRange(1, JOB_COL.TRACKING_OPTIONS).setNote(
+    'Comma-separated, e.g. Project A, Project B.\nA bill is kept if ANY line matches. Case-insensitive.'
+  );
+  jobsSheet.getRange(1, JOB_COL.STATUS).setNote(
+    "Leave blank or choose 'Pending' to queue a job.\nTo retry an 'Error' job, set it back to 'Pending': it continues from the saved page."
+  );
+}
+
+/**
+ * Reads all job rows that have an entity.
+ * @return {Array<Object>} Jobs.
+ */
+function readJobs_() {
+  const sheet = getControlSheet_(CONTROL_SHEET_NAMES.JOBS);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const values = sheet.getRange(2, 1, lastRow - 1, JOB_HEADERS.length).getValues();
+  return values
+    .map((row, i) => ({
+      row: i + 2,
+      entity: String(row[JOB_COL.ENTITY - 1] || '').trim().toUpperCase(),
+      period: row[JOB_COL.PERIOD - 1],
+      dateFrom: row[JOB_COL.DATE_FROM - 1],
+      dateTo: row[JOB_COL.DATE_TO - 1],
+      trackingCategory: String(row[JOB_COL.TRACKING_CATEGORY - 1] || '').trim(),
+      trackingOptions: splitList_(row[JOB_COL.TRACKING_OPTIONS - 1]),
+      status: String(row[JOB_COL.STATUS - 1] || '').trim(),
+      fileId: String(row[JOB_COL.FILE_ID - 1] || '').trim(),
+      nextPage: Number(row[JOB_COL.NEXT_PAGE - 1]) || 0
+    }))
+    .filter((job) => job.entity);
+}
+
+/**
+ * Writes fields to a job row and stamps Last Updated.
+ * @param {number} row - Sheet row number.
+ * @param {Object} patch - Keys of JOB_COL mapped to values.
+ * @throws {Error} If a key isn't a known column.
+ */
+function updateJob_(row, patch) {
+  const sheet = getControlSheet_(CONTROL_SHEET_NAMES.JOBS);
+  Object.keys(patch).forEach((key) => {
+    const col = JOB_COL[key];
+    if (!col) throw new Error(`updateJob_: unknown column '${key}'`);
+    const value = key === 'MESSAGE' ? String(patch[key]).slice(0, 1000) : patch[key];
+    sheet.getRange(row, col).setValue(value);
+  });
+  sheet.getRange(row, JOB_COL.LAST_UPDATED).setValue(new Date());
+}
+
+/**
+ * Writes the bills file name as a link into a job row.
+ * @param {number} row - Sheet row number.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} billsSpreadsheet - Bills file.
+ */
+function setJobBillsFileLink_(row, billsSpreadsheet) {
+  const link = SpreadsheetApp.newRichTextValue()
+    .setText(billsSpreadsheet.getName())
+    .setLinkUrl(billsSpreadsheet.getUrl())
+    .build();
+  getControlSheet_(CONTROL_SHEET_NAMES.JOBS).getRange(row, JOB_COL.BILLS_FILE).setRichTextValue(link);
+}
+
+/**
+ * Finds the job row that owns a bills file.
+ * @param {string} fileId - Bills spreadsheet ID.
+ * @return {number|null} Row number, or null if not found.
+ */
+function findJobRowByFileId_(fileId) {
+  const sheet = getControlSheet_(CONTROL_SHEET_NAMES.JOBS);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  const ids = sheet.getRange(2, JOB_COL.FILE_ID, lastRow - 1, 1).getValues();
+  const index = ids.findIndex((r) => String(r[0]).trim() === fileId);
+  return index === -1 ? null : index + 2;
+}
+
+/**
+ * Reads one entity's row from the Entities sheet.
+ * @param {string} entity - Entity key.
+ * @return {Object|null} {row, entity, tenantName, tenantId, status}, or null.
+ */
+function getEntity_(entity) {
+  const sheet = getControlSheet_(CONTROL_SHEET_NAMES.ENTITIES);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  const values = sheet.getRange(2, 1, lastRow - 1, ENTITY_HEADERS.length).getValues();
+  const index = values.findIndex((r) => String(r[ENTITY_COL.ENTITY - 1]).trim().toUpperCase() === entity);
+  if (index === -1) return null;
+  const row = values[index];
+  return {
+    row: index + 2,
+    entity: entity,
+    tenantName: String(row[ENTITY_COL.TENANT_NAME - 1] || '').trim(),
+    tenantId: String(row[ENTITY_COL.TENANT_ID - 1] || '').trim(),
+    status: String(row[ENTITY_COL.STATUS - 1] || '').trim()
+  };
+}
+
+/**
+ * Writes fields to an entity row and stamps Updated.
+ * @param {string} entity - Entity key.
+ * @param {Object} patch - Keys of ENTITY_COL mapped to values.
+ * @throws {Error} If the entity row doesn't exist.
+ */
+function updateEntity_(entity, patch) {
+  const record = getEntity_(entity);
+  if (!record) throw new Error(`Entity '${entity}' is not on the Entities sheet.`);
+  const sheet = getControlSheet_(CONTROL_SHEET_NAMES.ENTITIES);
+  Object.keys(patch).forEach((key) => sheet.getRange(record.row, ENTITY_COL[key]).setValue(patch[key]));
+  sheet.getRange(record.row, ENTITY_COL.UPDATED).setValue(new Date());
+}
