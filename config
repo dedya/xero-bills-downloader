@@ -1,0 +1,304 @@
+/**
+ * Config.gs
+ * Purpose: All constants for the Xero bills & attachments downloader:
+ *          Xero endpoints, run-time budgets, sheet layouts, column indices,
+ *          folder names and status labels. Secrets live in Script Properties
+ *          and are read through the getters at the bottom of this file.
+ * Depends on: none
+ * Last updated: 2026-10-02 (separate fetch / download)
+ */
+
+// --- Xero API ---
+const XERO = Object.freeze({
+  AUTHORIZE_URL: "https://login.xero.com/identity/connect/authorize",
+  TOKEN_URL: "https://identity.xero.com/connect/token",
+  CONNECTIONS_URL: "https://api.xero.com/connections",
+  API_BASE: "https://api.xero.com/api.xro/2.0",
+  SCOPES:
+    "openid profile email offline_access " +
+    "accounting.invoices.read accounting.contacts accounting.settings accounting.attachments",
+  SERVICE_PREFIX: "Xero_", // OAuth2 service name = Xero_<ENTITY>
+  PAGE_SIZE: 100, // Xero returns up to 100 invoices per page
+  MAX_CALLS_PER_MIN: 55, // stay under Xero's 60/min per organisation
+  MAX_401_RETRIES: 1,
+  MAX_429_RETRIES: 5,
+  MAX_5XX_RETRIES: 2,
+  DEFAULT_DAILY_PAUSE_SECONDS: 3600, // used if Xero sends no Retry-After on a daily-limit 429
+});
+
+// --- Run budget (Apps Script hard limit is 6 minutes per execution) ---
+const RUN = Object.freeze({
+  MAX_RUNTIME_MS: 4.5 * 60 * 1000,
+  MIN_TIME_FOR_NEXT_STEP_MS: 30 * 1000, // don't start a new page / bill with less than this left
+  MIN_TIME_FOR_NEXT_FILE_MS: 15 * 1000, // don't start a new attachment download with less than this left
+  TRIGGER_INTERVAL_MINUTES: 10, // attachments schedule; allowed values: 1, 5, 10, 15, 30
+  LOCK_WAIT_MS: 5000,
+  ERROR_EMAIL_DEDUPE_SECONDS: 6 * 60 * 60,
+});
+
+// --- Bill list behaviour ---
+const BILLS = Object.freeze({
+  EXCLUDE_ZERO_AMOUNT: true, // skip bills whose total is 0
+  CONTINUATION_DELAY_MS: 60 * 1000, // gap before "Fetch Xero bills" continues an unfinished job
+});
+
+// --- Trigger handler names ---
+const TRIGGER_HANDLERS = Object.freeze({
+  FETCH_BILLS: "run_fetchBills",
+  DOWNLOAD_ATTACHMENTS: "run_downloadAttachments",
+  LEGACY: ["run_scheduledTick"], // removed by Install / Remove schedule
+});
+
+// --- Attachment behaviour ---
+const ATTACHMENTS = Object.freeze({
+  MAX_ROW_ATTEMPTS: 3, // after this many failures a bill is marked "Failed"
+  GROUP_BY_BILLS_FILE: true, // attachments/<bills file name>/<bill folder>/
+  CREATE_EMPTY_FOLDERS: false, // create a Drive folder for bills with no attachments
+  DOWNLOAD_DESCRIPTION_LINKS: true, // copy Google Drive files linked in the bill description
+  EXPORT_GOOGLE_FILES_AS_PDF: true, // linked Google Docs/Sheets/Slides are saved as PDF
+});
+
+// Google-native file types that can't be copied as a normal file and are exported instead.
+const GOOGLE_EXPORTABLE_MIME_TYPES = [
+  "application/vnd.google-apps.document",
+  "application/vnd.google-apps.spreadsheet",
+  "application/vnd.google-apps.presentation",
+  "application/vnd.google-apps.drawing",
+];
+const GOOGLE_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut";
+
+// --- Drive folders (created next to the control spreadsheet unless ROOT_FOLDER_ID is set) ---
+const FOLDER_NAMES = Object.freeze({
+  BILLS: "bills",
+  ATTACHMENTS: "attachments",
+  PROCESSED: "processed bills",
+});
+
+// --- Control spreadsheet ---
+const CONTROL_SHEET_NAMES = Object.freeze({
+  JOBS: "Jobs",
+  ENTITIES: "Entities",
+});
+const DEFAULT_ENTITIES = ["FOBE", "SFHK", "SFJO"];
+
+const JOB_COL = Object.freeze({
+  ENTITY: 1,
+  PERIOD: 2,
+  DATE_FROM: 3,
+  DATE_TO: 4,
+  TRACKING_CATEGORY: 5,
+  TRACKING_OPTIONS: 6,
+  STATUS: 7,
+  BILLS_FILE: 8,
+  BILLS_FOUND: 9,
+  ATTACHMENTS_PROGRESS: 10,
+  LAST_UPDATED: 11,
+  MESSAGE: 12,
+  FILE_ID: 13, // hidden
+  NEXT_PAGE: 14, // hidden
+});
+const JOB_HEADERS = [
+  "Entity",
+  "Period",
+  "Date From",
+  "Date To",
+  "Tracking Category",
+  "Tracking Options",
+  "Status",
+  "Bills File",
+  "Bills Found",
+  "Attachments Done",
+  "Last Updated",
+  "Message",
+  "File ID",
+  "Next Page",
+];
+const JOB_COLUMN_WIDTHS = [
+  80, 90, 100, 100, 140, 200, 170, 280, 90, 120, 140, 360, 120, 80,
+];
+const JOB_STATUS = Object.freeze({
+  PENDING: "Pending",
+  DOWNLOADING: "Downloading bills",
+  PAUSED: "Paused (Xero daily limit)",
+  QUEUED: "Attachments queued",
+  ATTACHMENTS: "Downloading attachments",
+  DONE: "Done",
+  ERROR: "Error",
+});
+
+// Job statuses the "Fetch Xero bills" process picks up.
+const BILL_QUEUE_STATUSES = [
+  "",
+  JOB_STATUS.PENDING,
+  JOB_STATUS.DOWNLOADING,
+  JOB_STATUS.PAUSED,
+];
+
+const ENTITY_COL = Object.freeze({
+  ENTITY: 1,
+  TENANT_NAME: 2,
+  TENANT_ID: 3,
+  STATUS: 4,
+  UPDATED: 5,
+});
+const ENTITY_HEADERS = [
+  "Entity",
+  "Tenant Name",
+  "Tenant ID",
+  "Status",
+  "Updated",
+];
+const ENTITY_COLUMN_WIDTHS = [80, 260, 300, 150, 140];
+const ENTITY_STATUS = Object.freeze({
+  CONNECTED: "Connected",
+  DISCONNECTED: "Disconnected",
+  CHOOSE_TENANT: "Choose tenant",
+});
+
+// --- Bills spreadsheet (one per job) ---
+const BILLS_SHEET_NAME = "ACCPAY Bills";
+const JOB_INFO_SHEET_NAME = "Job Info";
+
+const BILL_COL = Object.freeze({
+  ENTITY: 1,
+  UPDATED_UTC: 2,
+  INVOICE_ID: 3,
+  INVOICE_NUMBER: 4,
+  INVOICE_DATE: 5,
+  CONTACT: 6,
+  CURRENCY: 7,
+  AMOUNT: 8,
+  XERO_STATUS: 9,
+  DESCRIPTION: 10,
+  TOTAL_ATTACHMENTS: 11,
+  LINKED_FILES: 12,
+  PROCESSED: 13,
+  FOLDER: 14,
+  ATTEMPTS: 15,
+  LAST_ERROR: 16,
+});
+const BILL_HEADERS = [
+  "Entity",
+  "Timestamp (Updated UTC)",
+  "Invoice ID",
+  "Invoice Number",
+  "Invoice Date",
+  "Contact",
+  "Currency",
+  "Amount",
+  "Xero Status",
+  "Description",
+  "Total Attachments",
+  "Linked Files",
+  "Attachments Processed",
+  "Attachments Folder",
+  "Attempts",
+  "Last Error",
+];
+const BILL_COLUMN_WIDTHS = [
+  70, 150, 280, 150, 100, 240, 70, 110, 100, 360, 110, 90, 140, 300, 70, 300,
+];
+const BILL_DATA_COLUMN_COUNT = 10; // A:J are written by the bills download
+const BILL_DATA_NUMBER_FORMATS = [
+  "@",
+  "@",
+  "@",
+  "@",
+  "yyyy-mm-dd",
+  "@",
+  "@",
+  "#,##0.00",
+  "@",
+  "@",
+];
+const MAX_DESCRIPTION_CHARS = 20000; // a cell holds 50,000; keeps the sheet light
+const BILL_PROCESSED = Object.freeze({ YES: "Yes", FAILED: "Failed" });
+
+const JOB_INFO_KEY = Object.freeze({
+  ENTITY: "Entity",
+  PERIOD: "Period",
+  TRACKING_CATEGORY: "Tracking Category",
+  TRACKING_OPTIONS: "Tracking Options",
+  XERO_FILTER: "Xero Filter",
+  FILTER_FINGERPRINT: "Filter Fingerprint",
+  CONTROL_SHEET: "Control Sheet",
+  DOWNLOAD_STATUS: "Download Status",
+  DOWNLOAD_STARTED: "Download Started",
+  DOWNLOAD_COMPLETED: "Download Completed",
+  BILLS_FOUND: "Bills Found",
+  ZERO_AMOUNT_EXCLUDED: "Zero-Amount Bills Excluded",
+  ATTACHMENTS_FOLDER: "Attachments Folder",
+  ATTACHMENTS_FOLDER_ID: "Attachments Folder ID",
+  ATTACHMENTS_STATUS: "Attachments Status",
+  ATTACHMENTS_COMPLETED: "Attachments Completed",
+});
+const DOWNLOAD_STATUS = Object.freeze({
+  IN_PROGRESS: "In progress",
+  COMPLETE: "Complete",
+});
+
+// --- Styling (org standard: min font 10, no merged cells, frozen header row + first column) ---
+const STYLE = Object.freeze({
+  FONT_SIZE: 10,
+  HEADER_FONT_COLOR: "#FFFFFF",
+  HEADER_BACKGROUND: "#1F4E78",
+});
+
+// --- Script Property keys ---
+const PROP_KEYS = Object.freeze({
+  CLIENT_ID: "XERO_CLIENT_ID",
+  CLIENT_SECRET: "XERO_CLIENT_SECRET",
+  ROOT_FOLDER_ID: "ROOT_FOLDER_ID",
+  NOTIFY_EMAIL: "NOTIFY_EMAIL",
+  CONTROL_SPREADSHEET_ID: "CONTROL_SPREADSHEET_ID",
+  PAUSE_PREFIX: "XERO_PAUSE_UNTIL_",
+});
+
+/**
+ * Returns the Xero Client ID, preferring an entity-specific override
+ * (XERO_CLIENT_ID_<ENTITY>) over the shared XERO_CLIENT_ID.
+ * @param {string} entity - Entity key, e.g. FOBE.
+ * @return {string|null} Client ID.
+ */
+function getXeroClientId_(entity) {
+  const props = PropertiesService.getScriptProperties();
+  return (
+    props.getProperty(`${PROP_KEYS.CLIENT_ID}_${entity}`) ||
+    props.getProperty(PROP_KEYS.CLIENT_ID)
+  );
+}
+
+/**
+ * Returns the Xero Client Secret, preferring an entity-specific override.
+ * @param {string} entity - Entity key, e.g. FOBE.
+ * @return {string|null} Client secret.
+ */
+function getXeroClientSecret_(entity) {
+  const props = PropertiesService.getScriptProperties();
+  return (
+    props.getProperty(`${PROP_KEYS.CLIENT_SECRET}_${entity}`) ||
+    props.getProperty(PROP_KEYS.CLIENT_SECRET)
+  );
+}
+
+/**
+ * Returns the optional root folder ID for the bills/attachments/processed folders.
+ * @return {string|null} Drive folder ID, or null to use the control sheet's folder.
+ */
+function getRootFolderIdSetting_() {
+  return PropertiesService.getScriptProperties().getProperty(
+    PROP_KEYS.ROOT_FOLDER_ID,
+  );
+}
+
+/**
+ * Returns the address that receives failure and completion emails.
+ * @return {string} Email address.
+ */
+function getNotifyEmail_() {
+  return (
+    PropertiesService.getScriptProperties().getProperty(
+      PROP_KEYS.NOTIFY_EMAIL,
+    ) || Session.getEffectiveUser().getEmail()
+  );
+}

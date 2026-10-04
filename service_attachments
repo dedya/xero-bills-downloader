@@ -1,0 +1,271 @@
+/**
+ * Service_Attachments.gs
+ * Purpose: Scheduled processing of the "bills" folder: for every completed
+ *          bills file, downloads each unprocessed bill's Xero attachments
+ *          and any Google Drive files linked in its description into Drive, marks the row, and moves the file to "processed bills" once
+ *          every row is done.
+ * Depends on: Config.gs, Utils.gs, Service_Control.gs, Service_Xero.gs,
+ *             Service_Drive.gs, Service_Bills.gs (getJobInfo_, setJobInfo_)
+ * Last updated: 2026-10-02 (description links)
+ */
+
+/**
+ * Works through the bills folder, oldest file first, until the run budget is used.
+ * @param {Object} ctx - Run context.
+ */
+function runAttachmentQueue_(ctx) {
+  if (!hasTimeLeft_(ctx)) return;
+  const folders = getWorkFolders_();
+  for (const file of listSpreadsheetsInFolder_(folders.bills)) {
+    if (!hasTimeLeft_(ctx)) return;
+    try {
+      const ss = SpreadsheetApp.openById(file.getId());
+      if (getJobInfo_(ss)[JOB_INFO_KEY.DOWNLOAD_STATUS] !== DOWNLOAD_STATUS.COMPLETE) continue;
+      processBillsFile_(ctx, ss, folders);
+    } catch (error) {
+      if (error instanceof RetryLaterError) return;
+      logError_(`runAttachmentQueue_ (${file.getName()})`, error);
+      ctx.errors.push(`${file.getName()}: ${error.message}`);
+    }
+  }
+}
+
+/**
+ * Processes the unmarked rows of one bills file and finalises it when none remain.
+ * @param {Object} ctx - Run context.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - Bills spreadsheet.
+ * @param {Object} folders - From getWorkFolders_().
+ * @throws {RetryLaterError} When the run budget runs out mid-file.
+ */
+function processBillsFile_(ctx, ss, folders) {
+  const sheet = ss.getSheetByName(BILLS_SHEET_NAME);
+  if (!sheet) return;
+  const jobRow = findJobRowByFileId_(ss.getId());
+  const timeZone = ss.getSpreadsheetTimeZone();
+  const lastRow = sheet.getLastRow();
+  const rows = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, BILL_HEADERS.length).getValues() : [];
+
+  let parentFolder = null;
+  let statusMarked = false;
+  let outOfTime = false;
+
+  for (let i = 0; i < rows.length; i++) {
+    const values = rows[i];
+    if (String(values[BILL_COL.PROCESSED - 1]).trim() !== '') continue;
+    if (!hasTimeLeft_(ctx)) {
+      outOfTime = true;
+      break;
+    }
+    const entity = String(values[BILL_COL.ENTITY - 1]).trim().toUpperCase();
+    if (isEntityPaused_(entity)) continue;
+
+    if (!parentFolder) parentFolder = getAttachmentsParentFolder_(ss, folders);
+    if (jobRow && !statusMarked) {
+      updateJob_(jobRow, { STATUS: JOB_STATUS.ATTACHMENTS });
+      statusMarked = true;
+    }
+
+    try {
+      processBillRow_(ctx, sheet, i + 2, values, parentFolder, timeZone);
+    } catch (error) {
+      if (error instanceof DailyLimitError) {
+        setEntityPause_(error.entity, error.retryAfterSeconds);
+        if (jobRow) updateJob_(jobRow, { MESSAGE: error.message });
+        continue;
+      }
+      if (error instanceof RetryLaterError) {
+        outOfTime = true;
+        break;
+      }
+      throw error;
+    }
+  }
+
+  const summary = summariseBillRows_(sheet);
+  if (jobRow) updateJob_(jobRow, { ATTACHMENTS_PROGRESS: `${summary.done + summary.failed} / ${summary.total}` });
+  if (summary.pending === 0) finaliseBillsFile_(ctx, ss, folders, jobRow, summary);
+  if (outOfTime) throw new RetryLaterError('Run budget used; continuing on the next run.');
+}
+
+/**
+ * Downloads one bill's Xero attachments plus any Google Drive files linked in
+ * its Description, and records the result on its row. Files already in the
+ * bill's folder are skipped, so an interrupted bill resumes cleanly.
+ * @param {Object} ctx - Run context.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - ACCPAY Bills sheet.
+ * @param {number} rowNumber - Sheet row number.
+ * @param {Array} values - Current row values.
+ * @param {Folder} parentFolder - Folder that holds the per-bill folders.
+ * @param {string} timeZone - Bills spreadsheet time zone.
+ * @throws {DailyLimitError|RetryLaterError} Passed up so the caller can stop or pause.
+ */
+function processBillRow_(ctx, sheet, rowNumber, values, parentFolder, timeZone) {
+  const entity = String(values[BILL_COL.ENTITY - 1]).trim().toUpperCase();
+  const invoiceId = String(values[BILL_COL.INVOICE_ID - 1]).trim();
+  const attempts = Number(values[BILL_COL.ATTEMPTS - 1]) || 0;
+  let folderUrl = String(values[BILL_COL.FOLDER - 1] || '');
+  let totalAttachments = values[BILL_COL.TOTAL_ATTACHMENTS - 1];
+  let linkedFiles = values[BILL_COL.LINKED_FILES - 1];
+
+  try {
+    if (!invoiceId) throw new Error('Row has no Invoice ID.');
+    const attachments = listInvoiceAttachments_(ctx, entity, invoiceId);
+    const links = ATTACHMENTS.DOWNLOAD_DESCRIPTION_LINKS
+      ? extractDriveLinks_(values[BILL_COL.DESCRIPTION - 1])
+      : [];
+    const fileLinks = links.filter((link) => !link.isFolder);
+    const notes = links.filter((link) => link.isFolder).map((link) => `Skipped folder link: ${link.url}`);
+    totalAttachments = attachments.length;
+    linkedFiles = fileLinks.length;
+
+    if (attachments.length || fileLinks.length || ATTACHMENTS.CREATE_EMPTY_FOLDERS) {
+      const folder = folderUrl
+        ? DriveApp.getFolderById(extractDriveId_(folderUrl))
+        : createUniqueChildFolder_(parentFolder, buildBillFolderName_(values, timeZone));
+      if (!folderUrl) {
+        folderUrl = folder.getUrl();
+        sheet.getRange(rowNumber, BILL_COL.FOLDER).setValue(folderUrl); // saved now so a retry reuses it
+      }
+
+      for (const attachment of attachments) {
+        requireFileTime_(ctx);
+        const fileName = sanitizeFileName_(attachment.FileName || `attachment_${attachment.AttachmentID}`);
+        if (folderHasFile_(folder, fileName)) continue;
+        const blob = downloadInvoiceAttachment_(ctx, entity, invoiceId, attachment);
+        folder.createFile(blob.setName(fileName));
+      }
+
+      for (const link of fileLinks) {
+        requireFileTime_(ctx);
+        if (copyLinkedDriveFile_(link.id, folder)) ctx.stats.filesDownloaded += 1;
+      }
+    }
+
+    writeBillRowResult_(sheet, rowNumber, [
+      totalAttachments,
+      linkedFiles,
+      BILL_PROCESSED.YES,
+      folderUrl,
+      attempts + 1,
+      notes.join('\n')
+    ]);
+    ctx.stats.billsProcessed += 1;
+  } catch (error) {
+    if (error instanceof DailyLimitError || error instanceof RetryLaterError) throw error;
+    logError_(`processBillRow_ (row ${rowNumber}, ${invoiceId})`, error);
+    const nextAttempts = attempts + 1;
+    const processed = nextAttempts >= ATTACHMENTS.MAX_ROW_ATTEMPTS ? BILL_PROCESSED.FAILED : '';
+    writeBillRowResult_(sheet, rowNumber, [
+      totalAttachments === undefined ? '' : totalAttachments,
+      linkedFiles === undefined ? '' : linkedFiles,
+      processed,
+      folderUrl,
+      nextAttempts,
+      String(error.message).slice(0, 500)
+    ]);
+  }
+}
+
+/**
+ * Throws RetryLaterError if there isn't enough time left to start another file.
+ * @param {Object} ctx - Run context.
+ * @throws {RetryLaterError} When the run budget is nearly used.
+ */
+function requireFileTime_(ctx) {
+  if (getRemainingMs_(ctx) < RUN.MIN_TIME_FOR_NEXT_FILE_MS) {
+    throw new RetryLaterError('Out of time part-way through a bill.');
+  }
+}
+
+/**
+ * Writes columns K:P (Total, Linked Files, Processed, Folder, Attempts, Last Error) for one row.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - ACCPAY Bills sheet.
+ * @param {number} rowNumber - Sheet row number.
+ * @param {Array} resultValues - Six values in column order (K:P).
+ */
+function writeBillRowResult_(sheet, rowNumber, resultValues) {
+  sheet
+    .getRange(rowNumber, BILL_COL.TOTAL_ATTACHMENTS, 1, resultValues.length)
+    .setFontSize(STYLE.FONT_SIZE)
+    .setValues([resultValues]);
+}
+
+/**
+ * Builds a bill folder name: <yymmdd>_<amount>_<contact>.
+ * @param {Array} values - Row values.
+ * @param {string} timeZone - Bills spreadsheet time zone.
+ * @return {string} Folder name.
+ */
+function buildBillFolderName_(values, timeZone) {
+  const invoiceDate = values[BILL_COL.INVOICE_DATE - 1];
+  const amount = values[BILL_COL.AMOUNT - 1];
+  const yymmdd = invoiceDate instanceof Date ? Utilities.formatDate(invoiceDate, timeZone, 'yyMMdd') : '000000';
+  const amountText = typeof amount === 'number' ? amount.toFixed(2) : '0.00';
+  return `${yymmdd}_${amountText}_${sanitizeFileName_(values[BILL_COL.CONTACT - 1])}`;
+}
+
+/**
+ * Returns the folder that receives this bills file's per-bill folders.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - Bills spreadsheet.
+ * @param {Object} folders - From getWorkFolders_().
+ * @return {Folder} attachments/<bills file name>, or attachments/ itself.
+ */
+function getAttachmentsParentFolder_(ss, folders) {
+  if (!ATTACHMENTS.GROUP_BY_BILLS_FILE) return folders.attachments;
+  const savedId = getJobInfo_(ss)[JOB_INFO_KEY.ATTACHMENTS_FOLDER_ID];
+  if (savedId) return DriveApp.getFolderById(savedId);
+  const folder = getOrCreateChildFolder_(folders.attachments, ss.getName());
+  setJobInfo_(ss, JOB_INFO_KEY.ATTACHMENTS_FOLDER_ID, folder.getId());
+  setJobInfo_(ss, JOB_INFO_KEY.ATTACHMENTS_FOLDER, folder.getUrl());
+  return folder;
+}
+
+/**
+ * Counts rows by processing state.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - ACCPAY Bills sheet.
+ * @return {{total: number, done: number, failed: number, pending: number}} Counts.
+ */
+function summariseBillRows_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const flags = lastRow >= 2 ? sheet.getRange(2, BILL_COL.PROCESSED, lastRow - 1, 1).getValues() : [];
+  const summary = { total: flags.length, done: 0, failed: 0, pending: 0 };
+  flags.forEach(([flag]) => {
+    const value = String(flag).trim();
+    if (value === BILL_PROCESSED.YES) summary.done += 1;
+    else if (value === BILL_PROCESSED.FAILED) summary.failed += 1;
+    else summary.pending += 1;
+  });
+  return summary;
+}
+
+/**
+ * Marks a bills file complete, moves it to "processed bills" and updates its job row.
+ * @param {Object} ctx - Run context.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - Bills spreadsheet.
+ * @param {Object} folders - From getWorkFolders_().
+ * @param {number|null} jobRow - Control sheet row, if found.
+ * @param {Object} summary - From summariseBillRows_().
+ */
+function finaliseBillsFile_(ctx, ss, folders, jobRow, summary) {
+  setJobInfo_(ss, JOB_INFO_KEY.ATTACHMENTS_STATUS, DOWNLOAD_STATUS.COMPLETE);
+  setJobInfo_(ss, JOB_INFO_KEY.ATTACHMENTS_COMPLETED, new Date());
+  moveFileToFolder_(ss.getId(), folders.processed);
+
+  if (jobRow) {
+    updateJob_(jobRow, {
+      STATUS: JOB_STATUS.DONE,
+      MESSAGE: summary.failed
+        ? `${summary.failed} bill(s) failed after ${ATTACHMENTS.MAX_ROW_ATTEMPTS} attempts: see Last Error in the bills file.`
+        : 'All attachments downloaded. File moved to "' + FOLDER_NAMES.PROCESSED + '".'
+    });
+  }
+  ctx.completed.push({
+    name: ss.getName(),
+    url: ss.getUrl(),
+    total: summary.total,
+    done: summary.done,
+    failed: summary.failed,
+    attachmentsUrl: getJobInfo_(ss)[JOB_INFO_KEY.ATTACHMENTS_FOLDER] || ''
+  });
+  logInfo_('finaliseBillsFile_', `${ss.getName()} complete (${summary.done} ok, ${summary.failed} failed)`);
+}

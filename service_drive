@@ -1,0 +1,124 @@
+/**
+ * Service_Drive.gs
+ * Purpose: Drive folder handling: locating/creating the bills, attachments and
+ *          processed-bills folders, unique bill folders, file moves and listings.
+ * Depends on: Config.gs, Service_Control.gs (getControlSpreadsheet_)
+ * Last updated: 2026-10-02 (description links)
+ */
+
+/**
+ * Returns the three working folders, creating any that are missing.
+ * They sit in ROOT_FOLDER_ID if set, otherwise next to the control spreadsheet.
+ * @return {{root: Folder, bills: Folder, attachments: Folder, processed: Folder}} Folders.
+ */
+function getWorkFolders_() {
+  const rootId = getRootFolderIdSetting_();
+  let root;
+  if (rootId) {
+    root = DriveApp.getFolderById(rootId);
+  } else {
+    const parents = DriveApp.getFileById(getControlSpreadsheet_().getId()).getParents();
+    root = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();
+  }
+  return {
+    root: root,
+    bills: getOrCreateChildFolder_(root, FOLDER_NAMES.BILLS),
+    attachments: getOrCreateChildFolder_(root, FOLDER_NAMES.ATTACHMENTS),
+    processed: getOrCreateChildFolder_(root, FOLDER_NAMES.PROCESSED)
+  };
+}
+
+/**
+ * Returns the child folder with this name, creating it if it doesn't exist.
+ * @param {Folder} parent - Parent folder.
+ * @param {string} name - Child folder name.
+ * @return {Folder} Child folder.
+ */
+function getOrCreateChildFolder_(parent, name) {
+  const existing = parent.getFoldersByName(name);
+  return existing.hasNext() ? existing.next() : parent.createFolder(name);
+}
+
+/**
+ * Creates a child folder, adding _2, _3… if the name is already taken, so two
+ * bills with the same date/amount/contact never share a folder.
+ * @param {Folder} parent - Parent folder.
+ * @param {string} baseName - Desired folder name.
+ * @return {Folder} New folder.
+ */
+function createUniqueChildFolder_(parent, baseName) {
+  let name = baseName;
+  let suffix = 2;
+  while (parent.getFoldersByName(name).hasNext()) {
+    name = `${baseName}_${suffix}`;
+    suffix += 1;
+  }
+  return parent.createFolder(name);
+}
+
+/**
+ * Whether a folder already contains a file with this exact name.
+ * @param {Folder} folder - Folder to check.
+ * @param {string} fileName - File name.
+ * @return {boolean} True if present.
+ */
+function folderHasFile_(folder, fileName) {
+  return folder.getFilesByName(fileName).hasNext();
+}
+
+/**
+ * Moves a Drive file into a folder.
+ * @param {string} fileId - File ID.
+ * @param {Folder} folder - Destination folder.
+ */
+function moveFileToFolder_(fileId, folder) {
+  DriveApp.getFileById(fileId).moveTo(folder);
+}
+
+/**
+ * Lists Google Sheets in a folder, oldest first.
+ * @param {Folder} folder - Folder to scan.
+ * @return {Array<File>} Spreadsheet files.
+ */
+function listSpreadsheetsInFolder_(folder) {
+  const files = [];
+  const iterator = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
+  while (iterator.hasNext()) files.push(iterator.next());
+  return files.sort((a, b) => a.getDateCreated() - b.getDateCreated());
+}
+
+/**
+ * Copies a Drive file linked in a bill description into the bill's folder.
+ * Shortcuts are followed; Google Docs/Sheets/Slides are exported as PDF when
+ * ATTACHMENTS.EXPORT_GOOGLE_FILES_AS_PDF is on. Skips the copy if a file of
+ * the same name is already there (so an interrupted bill resumes cleanly).
+ * @param {string} fileId - Linked Drive file ID.
+ * @param {Folder} destination - Bill folder.
+ * @return {boolean} True if a file was copied, false if it was already there.
+ * @throws {Error} If the script owner can't open the linked file.
+ */
+function copyLinkedDriveFile_(fileId, destination) {
+  let source;
+  try {
+    source = DriveApp.getFileById(fileId);
+    if (source.getMimeType() === GOOGLE_SHORTCUT_MIME_TYPE) source = DriveApp.getFileById(source.getTargetId());
+  } catch (error) {
+    throw new Error(
+      `Can't open the Drive file linked in the description (ID ${fileId}). ` +
+        `Share it with ${Session.getEffectiveUser().getEmail()} or check the link. (${error.message})`
+    );
+  }
+
+  const exportAsPdf =
+    ATTACHMENTS.EXPORT_GOOGLE_FILES_AS_PDF && GOOGLE_EXPORTABLE_MIME_TYPES.includes(source.getMimeType());
+  const baseName = sanitizeFileName_(source.getName());
+  const fileName = exportAsPdf && !/\.pdf$/i.test(baseName) ? `${baseName}.pdf` : baseName;
+  if (folderHasFile_(destination, fileName)) return false;
+
+  if (exportAsPdf) {
+    destination.createFile(source.getAs(MimeType.PDF).setName(fileName));
+  } else {
+    source.makeCopy(fileName, destination);
+  }
+  return true;
+}

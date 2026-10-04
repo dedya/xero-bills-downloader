@@ -1,0 +1,399 @@
+/**
+ * Utils.gs
+ * Purpose: Cross-cutting helpers: structured logging, notification emails,
+ *          run context / time budget, Xero rate limiting, error types,
+ *          date parsing, filename sanitising and header styling.
+ * Depends on: Config.gs
+ * Last updated: 2026-10-02 (description column)
+ */
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+/** Thrown when the run is about to exceed its time budget; work resumes next run. */
+class RetryLaterError extends Error {
+  /**
+   * @param {string} message - Why the work was deferred.
+   */
+  constructor(message) {
+    super(message);
+    this.name = 'RetryLaterError';
+  }
+}
+
+/** Thrown when Xero's 5,000 calls/day per organisation limit is used up. */
+class DailyLimitError extends Error {
+  /**
+   * @param {string} entity - Entity key that hit the limit.
+   * @param {number} retryAfterSeconds - Seconds until Xero allows calls again.
+   */
+  constructor(entity, retryAfterSeconds) {
+    super(
+      `Xero daily API limit reached for ${entity}. ` +
+        `Work resumes automatically in about ${(retryAfterSeconds / 3600).toFixed(1)}h.`
+    );
+    this.name = 'DailyLimitError';
+    this.entity = entity;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logging & notifications
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured error logger. Use inside every catch block.
+ * @param {string} context - Function name or step where the error occurred.
+ * @param {Error} error - The caught error object.
+ */
+function logError_(context, error) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    context: context,
+    message: error && error.message ? error.message : String(error),
+    stack: (error && error.stack) || null
+  };
+  console.error(JSON.stringify(payload));
+}
+
+/**
+ * Structured info logger.
+ * @param {string} context - Function name or step.
+ * @param {string} message - What happened.
+ */
+function logInfo_(context, message) {
+  console.log(JSON.stringify({ timestamp: new Date().toISOString(), context: context, message: message }));
+}
+
+/**
+ * Sends a failure email, suppressing identical messages for a few hours so a
+ * recurring problem doesn't send an email every trigger run.
+ * @param {string} message - Failure summary to include in the email.
+ */
+function notifyAdminOnFailure_(message) {
+  try {
+    const cache = CacheService.getScriptCache();
+    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, message);
+    const key = 'notify_' + Utilities.base64EncodeWebSafe(digest);
+    if (cache.get(key)) return;
+    MailApp.sendEmail(getNotifyEmail_(), 'Xero bills downloader: action needed', message);
+    cache.put(key, '1', RUN.ERROR_EMAIL_DEDUPE_SECONDS);
+  } catch (error) {
+    logError_('notifyAdminOnFailure_', error);
+  }
+}
+
+/**
+ * Emails a summary of bills files whose attachments have all been processed.
+ * @param {Array<Object>} completedFiles - Items {name, url, total, done, failed, attachmentsUrl}.
+ */
+function sendCompletionSummary_(completedFiles) {
+  if (!completedFiles.length) return;
+  try {
+    const lines = completedFiles.map(
+      (f) =>
+        `${f.name}\n  Bills: ${f.total}, downloaded: ${f.done}, failed: ${f.failed}\n` +
+        `  Bills file: ${f.url}\n  Attachments: ${f.attachmentsUrl || '(none)'}`
+    );
+    MailApp.sendEmail(
+      getNotifyEmail_(),
+      `Xero attachments complete (${completedFiles.length} file${completedFiles.length > 1 ? 's' : ''})`,
+      'These bills files are finished and have been moved to "' +
+        FOLDER_NAMES.PROCESSED +
+        '":\n\n' +
+        lines.join('\n\n')
+    );
+  } catch (error) {
+    logError_('sendCompletionSummary_', error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Run context & time budget
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the per-execution context shared by every step of a run.
+ * @return {Object} Run context.
+ */
+function buildRunContext_() {
+  const now = Date.now();
+  return {
+    startMs: now,
+    deadlineMs: now + RUN.MAX_RUNTIME_MS,
+    callLog: {},
+    services: {},
+    tenantIds: {},
+    errors: [],
+    completed: [],
+    stats: { billPages: 0, billsProcessed: 0, filesDownloaded: 0 }
+  };
+}
+
+/**
+ * Milliseconds left before this run should stop.
+ * @param {Object} ctx - Run context.
+ * @return {number} Remaining milliseconds.
+ */
+function getRemainingMs_(ctx) {
+  return ctx.deadlineMs - Date.now();
+}
+
+/**
+ * Whether there is enough time left to start another page or bill.
+ * @param {Object} ctx - Run context.
+ * @return {boolean} True if another step can start.
+ */
+function hasTimeLeft_(ctx) {
+  return getRemainingMs_(ctx) > RUN.MIN_TIME_FOR_NEXT_STEP_MS;
+}
+
+/**
+ * Sliding-window limiter: blocks until another Xero call is allowed for this entity.
+ * @param {Object} ctx - Run context.
+ * @param {string} entity - Entity key (Xero limits are per organisation).
+ * @throws {RetryLaterError} If waiting would exceed the run budget.
+ */
+function waitForRateLimit_(ctx, entity) {
+  const log = ctx.callLog[entity] || (ctx.callLog[entity] = []);
+  const now = Date.now();
+  while (log.length && now - log[0] >= 60000) log.shift();
+  if (log.length >= XERO.MAX_CALLS_PER_MIN) {
+    const waitMs = 60000 - (now - log[0]) + 50;
+    if (waitMs > getRemainingMs_(ctx)) {
+      throw new RetryLaterError('Out of time while waiting for the Xero per-minute limit.');
+    }
+    Utilities.sleep(waitMs);
+    waitForRateLimit_(ctx, entity);
+    return;
+  }
+  log.push(Date.now());
+}
+
+// ---------------------------------------------------------------------------
+// Entity pause (daily limit)
+// ---------------------------------------------------------------------------
+
+/**
+ * Records that an entity must not call Xero until the daily limit resets.
+ * @param {string} entity - Entity key.
+ * @param {number} seconds - Pause length in seconds.
+ */
+function setEntityPause_(entity, seconds) {
+  PropertiesService.getScriptProperties().setProperty(
+    PROP_KEYS.PAUSE_PREFIX + entity,
+    String(Date.now() + seconds * 1000)
+  );
+}
+
+/**
+ * Whether an entity is paused because of Xero's daily limit.
+ * @param {string} entity - Entity key.
+ * @return {boolean} True if still paused.
+ */
+function isEntityPaused_(entity) {
+  return getEntityPauseUntil_(entity) > 0;
+}
+
+/**
+ * When an entity's daily-limit pause ends (clearing it once it has passed).
+ * @param {string} entity - Entity key.
+ * @return {number} Epoch ms when the pause ends, or 0 if not paused.
+ */
+function getEntityPauseUntil_(entity) {
+  const props = PropertiesService.getScriptProperties();
+  const until = Number(props.getProperty(PROP_KEYS.PAUSE_PREFIX + entity) || 0);
+  if (!until) return 0;
+  if (until > Date.now()) return until;
+  props.deleteProperty(PROP_KEYS.PAUSE_PREFIX + entity);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Dates
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts epoch milliseconds from Xero's "/Date(ms+0000)/" or an ISO string.
+ * @param {string} value - Xero date value.
+ * @return {number|null} Epoch ms, or null if unparseable.
+ */
+function parseXeroEpochMs_(value) {
+  if (!value) return null;
+  const match = /\/Date\((-?\d+)/.exec(value);
+  if (match) return Number(match[1]);
+  const parsed = Date.parse(value);
+  return isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Builds a date-only value (midnight in the script time zone) for a Xero date,
+ * so the day never shifts when written to a sheet.
+ * @param {string} dateString - Xero "DateString", e.g. 2025-03-04T00:00:00.
+ * @param {string} dotNetDate - Xero "Date" fallback, e.g. /Date(1741046400000+0000)/.
+ * @return {Date|null} Date-only value.
+ */
+function buildXeroDateOnly_(dateString, dotNetDate) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateString || '');
+  if (match) return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  const ms = parseXeroEpochMs_(dotNetDate);
+  if (ms === null) return null;
+  const utc = new Date(ms);
+  return new Date(utc.getUTCFullYear(), utc.getUTCMonth(), utc.getUTCDate());
+}
+
+/**
+ * Formats Xero's UpdatedDateUTC as "yyyy-MM-dd HH:mm" in UTC.
+ * @param {string} value - Xero UpdatedDateUTC.
+ * @return {string} Formatted timestamp, or '' if missing.
+ */
+function formatXeroUtcTimestamp_(value) {
+  const ms = parseXeroEpochMs_(value);
+  return ms === null ? '' : Utilities.formatDate(new Date(ms), 'UTC', 'yyyy-MM-dd HH:mm');
+}
+
+/**
+ * Converts a sheet cell (Date or "YYYY-MM-DD" text) into {y, m, d}.
+ * @param {Date|string} value - Cell value.
+ * @param {string} timeZone - Time zone of the sheet the value came from.
+ * @param {string} label - Field name for error messages.
+ * @return {{y: number, m: number, d: number}} Date parts.
+ * @throws {Error} If the value is not a valid date.
+ */
+function toDateParts_(value, timeZone, label) {
+  const text = value instanceof Date ? Utilities.formatDate(value, timeZone, 'yyyy-MM-dd') : String(value).trim();
+  const match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(text);
+  if (!match) throw new Error(`${label} '${text}' is not a date (use YYYY-MM-DD).`);
+  return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]) };
+}
+
+/**
+ * Formats {y, m, d} as YYYY-MM-DD.
+ * @param {{y: number, m: number, d: number}} parts - Date parts.
+ * @return {string} ISO date.
+ */
+function formatDateParts_(parts) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${parts.y}-${pad(parts.m)}-${pad(parts.d)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Lower-cases and trims a value for case-insensitive comparisons.
+ * @param {*} value - Any value.
+ * @return {string} Normalised text.
+ */
+function normalise_(value) {
+  return String(value == null ? '' : value).trim().toLowerCase();
+}
+
+/**
+ * Splits a comma- or newline-separated cell into trimmed, non-empty items.
+ * @param {*} value - Cell value.
+ * @return {Array<string>} Items.
+ */
+function splitList_(value) {
+  return String(value == null ? '' : value)
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter((item) => item);
+}
+
+/**
+ * Makes a name safe for Windows filesystems (Drive folders are often downloaded as zip).
+ * @param {*} value - Raw name.
+ * @return {string} Sanitised name.
+ */
+function sanitizeFileName_(value) {
+  let text = value == null || value === '' ? 'Unknown' : String(value);
+  text = text.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').replace(/\s+/g, ' ').trim();
+  text = text.replace(/[. ]+$/, '');
+  return text || 'Unknown';
+}
+
+/**
+ * Pulls a Drive file/folder ID out of a Drive URL.
+ * @param {string} url - Drive URL.
+ * @return {string|null} ID, or null.
+ */
+function extractDriveId_(url) {
+  const match = /(?:folders\/|id=|\/d\/)([\w-]{20,})/.exec(String(url || ''));
+  return match ? match[1] : null;
+}
+
+/**
+ * Finds Google Drive / Docs links in free text (e.g. a bill description).
+ * Handles open?id=, uc?id=, /file/d/, /document/d/, /spreadsheets/d/,
+ * /presentation/d/ and /drive/folders/ URLs. Duplicates are removed.
+ * @param {*} text - Text to scan.
+ * @return {Array<{id: string, url: string, isFolder: boolean}>} Links found.
+ */
+function extractDriveLinks_(text) {
+  const urls = String(text == null ? '' : text).match(/https?:\/\/(?:drive|docs)\.google\.com\/[^\s<>"')\]]+/gi) || [];
+  const seen = new Set();
+  const links = [];
+  urls.forEach((url) => {
+    const folder = /\/folders\/([\w-]{20,})/.exec(url);
+    const file =
+      /\/(?:file|document|spreadsheets|presentation|drawings|forms)\/(?:u\/\d+\/)?d\/([\w-]{20,})/.exec(url) ||
+      /[?&]id=([\w-]{20,})/.exec(url);
+    const match = folder || file;
+    if (!match || seen.has(match[1])) return;
+    seen.add(match[1]);
+    links.push({ id: match[1], url: url, isFolder: Boolean(folder) });
+  });
+  return links;
+}
+
+/**
+ * Escapes text for safe inclusion in HTML.
+ * @param {*} value - Raw text.
+ * @return {string} Escaped text.
+ */
+function escapeHtml_(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ---------------------------------------------------------------------------
+// Sheet helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Applies the standard layout to a sheet: font size, header style, column
+ * widths, frozen header row and first column. Never merges cells.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Target sheet.
+ * @param {Array<string>} headers - Header labels for row 1.
+ * @param {Array<number>} widths - Column widths in pixels.
+ */
+function applyStandardLayout_(sheet, headers, widths) {
+  sheet.getRange(1, 1, sheet.getMaxRows(), headers.length).setFontSize(STYLE.FONT_SIZE);
+  sheet
+    .getRange(1, 1, 1, headers.length)
+    .setValues([headers])
+    .setFontWeight('bold')
+    .setFontColor(STYLE.HEADER_FONT_COLOR)
+    .setBackground(STYLE.HEADER_BACKGROUND)
+    .setVerticalAlignment('middle');
+  widths.forEach((width, i) => sheet.setColumnWidth(i + 1, width));
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(1);
+}
+
+/**
+ * Makes sure a sheet has room for `extraRows` more rows after its last row.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Target sheet.
+ * @param {number} extraRows - Rows about to be written.
+ */
+function ensureRowCapacity_(sheet, extraRows) {
+  const needed = sheet.getLastRow() + extraRows - sheet.getMaxRows();
+  if (needed > 0) sheet.insertRowsAfter(sheet.getMaxRows(), needed);
+}

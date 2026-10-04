@@ -1,0 +1,538 @@
+/**
+ * Service_Bills.gs
+ * Purpose: Turns queued rows on the Jobs sheet into bills spreadsheets in the
+ *          "bills" folder: builds the Xero filter, creates the file, pages
+ *          through Xero (resuming across runs) and marks the download complete.
+ *          Also holds the Job Info helpers shared with Service_Attachments.gs.
+ * Depends on: Config.gs, Utils.gs, Service_Control.gs, Service_Xero.gs, Service_Drive.gs
+ * Last updated: 2026-10-02 (zero-amount filter, no-bills message)
+ */
+
+/**
+ * Runs the "Fetch Xero bills" process: works through queued jobs, then
+ * reports whether anything is left so the caller can schedule a continuation.
+ * @param {Object} ctx - Run context.
+ * @return {{moreWork: boolean, resumeAt: Date|null}} What remains after this run.
+ */
+function runBillJobs_(ctx) {
+  processBillQueue_(ctx);
+  return getBillQueueOutlook_();
+}
+
+/**
+ * Works out whether queued jobs remain, and if they're all waiting for Xero's
+ * daily limit, when the earliest one can resume.
+ * @return {{moreWork: boolean, resumeAt: Date|null}} Queue outlook.
+ */
+function getBillQueueOutlook_() {
+  let moreWork = false;
+  let earliestPause = 0;
+  readJobs_()
+    .filter((job) => BILL_QUEUE_STATUSES.includes(job.status))
+    .forEach((job) => {
+      const pausedUntil = getEntityPauseUntil_(job.entity);
+      if (!pausedUntil) moreWork = true;
+      else if (!earliestPause || pausedUntil < earliestPause)
+        earliestPause = pausedUntil;
+    });
+  return {
+    moreWork: moreWork,
+    resumeAt:
+      !moreWork && earliestPause ? new Date(earliestPause + 60 * 1000) : null,
+  };
+}
+
+/**
+ * Processes queued bill-download jobs until the run budget is used.
+ * Jobs already downloading are resumed before new ones start.
+ * @param {Object} ctx - Run context.
+ */
+function processBillQueue_(ctx) {
+  const inFlight = [JOB_STATUS.DOWNLOADING, JOB_STATUS.PAUSED];
+  const queue = readJobs_()
+    .filter((job) => BILL_QUEUE_STATUSES.includes(job.status))
+    .sort(
+      (a, b) =>
+        Number(inFlight.includes(b.status)) -
+        Number(inFlight.includes(a.status)),
+    );
+  if (!queue.length) return;
+
+  const folders = getWorkFolders_();
+  for (const job of queue) {
+    if (!hasTimeLeft_(ctx)) return;
+    try {
+      processBillJob_(ctx, job, folders);
+    } catch (error) {
+      if (error instanceof DailyLimitError) {
+        setEntityPause_(error.entity, error.retryAfterSeconds);
+        updateJob_(job.row, {
+          STATUS: JOB_STATUS.PAUSED,
+          MESSAGE: error.message,
+        });
+        continue;
+      }
+      if (error instanceof RetryLaterError) {
+        updateJob_(job.row, {
+          MESSAGE: `${error.message} Continues automatically in about a minute.`,
+        });
+        return;
+      }
+      logError_(`processBillJob_ (Jobs row ${job.row})`, error);
+      updateJob_(job.row, { STATUS: JOB_STATUS.ERROR, MESSAGE: error.message });
+      ctx.errors.push(`Jobs row ${job.row} (${job.entity}): ${error.message}`);
+    }
+  }
+}
+
+/**
+ * Downloads (or continues downloading) the bills for one job.
+ * @param {Object} ctx - Run context.
+ * @param {Object} job - Job from readJobs_().
+ * @param {Object} folders - From getWorkFolders_().
+ * @throws {Error} On invalid parameters or Xero failures.
+ */
+function processBillJob_(ctx, job, folders) {
+  if (isEntityPaused_(job.entity)) {
+    updateJob_(job.row, {
+      STATUS: JOB_STATUS.PAUSED,
+      MESSAGE: "Waiting for the Xero daily limit to reset.",
+    });
+    return;
+  }
+
+  const filter = buildJobFilter_(
+    job,
+    getControlSpreadsheet_().getSpreadsheetTimeZone(),
+  );
+  requireConnectedEntity_(ctx, job.entity);
+
+  let billsSs;
+  if (!job.fileId) {
+    billsSs = createBillsSpreadsheet_(job, filter, folders);
+    job.fileId = billsSs.getId();
+    job.nextPage = 1;
+    setJobBillsFileLink_(job.row, billsSs);
+    updateJob_(job.row, {
+      FILE_ID: job.fileId,
+      NEXT_PAGE: 1,
+      STATUS: JOB_STATUS.DOWNLOADING,
+      MESSAGE: "Started.",
+      BILLS_FOUND: 0,
+    });
+  } else {
+    billsSs = SpreadsheetApp.openById(job.fileId);
+    const info = getJobInfo_(billsSs);
+    if (info[JOB_INFO_KEY.FILTER_FINGERPRINT] !== filter.fingerprint) {
+      throw new Error(
+        "The Period / Date / Tracking values were changed after this download started. " +
+          "Put them back, or clear Bills File and the hidden File ID / Next Page cells to start again.",
+      );
+    }
+    if (info[JOB_INFO_KEY.DOWNLOAD_STATUS] === DOWNLOAD_STATUS.COMPLETE) {
+      updateJob_(job.row, {
+        STATUS: JOB_STATUS.QUEUED,
+        MESSAGE: "Bills already downloaded.",
+      });
+      return;
+    }
+    updateJob_(job.row, { STATUS: JOB_STATUS.DOWNLOADING });
+  }
+
+  const sheet = billsSs.getSheetByName(BILLS_SHEET_NAME);
+  const knownIds = readExistingInvoiceIds_(sheet);
+  let zeroExcluded =
+    Number(getJobInfo_(billsSs)[JOB_INFO_KEY.ZERO_AMOUNT_EXCLUDED]) || 0;
+  let page = Math.max(job.nextPage, 1);
+
+  while (true) {
+    if (!hasTimeLeft_(ctx)) {
+      updateJob_(job.row, {
+        MESSAGE: `Paused before page ${page}; continues automatically in about a minute.`,
+      });
+      return;
+    }
+    const invoices = fetchBillsPage_(ctx, job.entity, filter.whereClause, page);
+    const matched = invoices.filter((inv) =>
+      passesTrackingFilter_(
+        inv,
+        filter.trackingCategory,
+        filter.trackingOptions,
+      ),
+    );
+    const kept = BILLS.EXCLUDE_ZERO_AMOUNT
+      ? matched.filter((inv) => Number(inv.Total) !== 0)
+      : matched;
+    if (kept.length !== matched.length) {
+      zeroExcluded += matched.length - kept.length;
+      setJobInfo_(billsSs, JOB_INFO_KEY.ZERO_AMOUNT_EXCLUDED, zeroExcluded);
+    }
+    const newRows = kept
+      .filter((inv) => !knownIds.has(inv.InvoiceID))
+      .map((inv) => buildBillRow_(job.entity, inv));
+    appendBillRows_(sheet, newRows);
+    newRows.forEach((row) => knownIds.add(row[BILL_COL.INVOICE_ID - 1]));
+
+    page += 1;
+    updateJob_(job.row, {
+      NEXT_PAGE: page,
+      BILLS_FOUND: knownIds.size,
+      MESSAGE: `Fetched ${page - 1} page(s) from Xero.`,
+    });
+    if (invoices.length < XERO.PAGE_SIZE) break;
+  }
+
+  setJobInfo_(billsSs, JOB_INFO_KEY.DOWNLOAD_STATUS, DOWNLOAD_STATUS.COMPLETE);
+  setJobInfo_(billsSs, JOB_INFO_KEY.DOWNLOAD_COMPLETED, new Date());
+  setJobInfo_(billsSs, JOB_INFO_KEY.BILLS_FOUND, knownIds.size);
+  const zeroNote = zeroExcluded
+    ? ` ${zeroExcluded} zero-amount bill(s) excluded.`
+    : "";
+
+  if (knownIds.size === 0) {
+    finaliseEmptyBillsFile_(billsSs, folders, job, filter, zeroNote);
+    return;
+  }
+
+  updateJob_(job.row, {
+    STATUS: JOB_STATUS.QUEUED,
+    NEXT_PAGE: "",
+    ATTACHMENTS_PROGRESS: `0 / ${knownIds.size}`,
+    MESSAGE: `${knownIds.size} bills listed.${zeroNote} Ready for Download attachments.`,
+  });
+  logInfo_(
+    "processBillJob_",
+    `${job.entity}: ${knownIds.size} bills written to ${billsSs.getName()}`,
+  );
+}
+
+/**
+ * Closes a job that found no bills: marks the file complete, moves it to
+ * "processed bills" as a record of the search, and sets the job to Done
+ * with a message saying exactly what was searched.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} billsSs - The empty bills file.
+ * @param {Object} folders - From getWorkFolders_().
+ * @param {Object} job - Job from readJobs_().
+ * @param {Object} filter - From buildJobFilter_().
+ * @param {string} zeroNote - Sentence about excluded zero-amount bills, or ''.
+ */
+function finaliseEmptyBillsFile_(billsSs, folders, job, filter, zeroNote) {
+  setJobInfo_(
+    billsSs,
+    JOB_INFO_KEY.ATTACHMENTS_STATUS,
+    "Not needed (no bills)",
+  );
+  moveFileToFolder_(billsSs.getId(), folders.processed);
+
+  const tracking = filter.trackingCategory
+    ? `, ${filter.trackingCategory}` +
+      (filter.trackingOptions.length
+        ? ` = ${filter.trackingOptions.join(" / ")}`
+        : "")
+    : "";
+  updateJob_(job.row, {
+    STATUS: JOB_STATUS.DONE,
+    NEXT_PAGE: "",
+    ATTACHMENTS_PROGRESS: "0 / 0",
+    MESSAGE:
+      `No bills found in Xero for ${job.entity}, ${filter.periodLabel}${tracking}.${zeroNote} ` +
+      'Nothing to download; the empty list was moved to "' +
+      FOLDER_NAMES.PROCESSED +
+      '".',
+  });
+  logInfo_(
+    "finaliseEmptyBillsFile_",
+    `${job.entity}: no bills for ${filter.periodLabel}${tracking}`,
+  );
+}
+
+/**
+ * Validates a job's parameters and builds the Xero filter for it.
+ * @param {Object} job - Job from readJobs_().
+ * @param {string} timeZone - Control spreadsheet time zone.
+ * @return {Object} {whereClause, trackingCategory, trackingOptions, periodLabel, fingerprint}.
+ * @throws {Error} If the parameters are invalid.
+ */
+function buildJobFilter_(job, timeZone) {
+  if (job.trackingOptions.length && !job.trackingCategory) {
+    throw new Error("Tracking Options needs a Tracking Category too.");
+  }
+  const range = parseJobPeriod_(job, timeZone);
+  let whereClause = 'Type=="ACCPAY"';
+  if (range) {
+    whereClause +=
+      `&&Date>=DateTime(${range.from.y},${range.from.m},${range.from.d})` +
+      `&&Date<=DateTime(${range.to.y},${range.to.m},${range.to.d})`;
+  }
+  const fingerprint = JSON.stringify({
+    where: whereClause,
+    category: normalise_(job.trackingCategory),
+    options: job.trackingOptions.map(normalise_).sort(),
+  });
+  return {
+    whereClause: whereClause,
+    trackingCategory: job.trackingCategory,
+    trackingOptions: job.trackingOptions,
+    periodLabel: range ? range.label : "All dates",
+    fingerprint: fingerprint,
+  };
+}
+
+/**
+ * Works out the date range from Period, or Date From / Date To.
+ * @param {Object} job - Job from readJobs_().
+ * @param {string} timeZone - Control spreadsheet time zone.
+ * @return {Object|null} {from, to, label} with {y, m, d} parts, or null for all dates.
+ * @throws {Error} If the values are invalid or combined incorrectly.
+ */
+function parseJobPeriod_(job, timeZone) {
+  if (job.period instanceof Date) {
+    throw new Error(
+      "Sheets turned Period into a date. Run Set up sheets (formats it as text) and retype it, e.g. 2026-03.",
+    );
+  }
+  const period = String(job.period == null ? "" : job.period).trim();
+  const hasFrom = job.dateFrom !== "" && job.dateFrom != null;
+  const hasTo = job.dateTo !== "" && job.dateTo != null;
+
+  if (period && (hasFrom || hasTo))
+    throw new Error("Use either Period or Date From / Date To, not both.");
+
+  if (period) {
+    let match = /^(\d{4})$/.exec(period);
+    if (match) {
+      const y = Number(match[1]);
+      return {
+        from: { y: y, m: 1, d: 1 },
+        to: { y: y, m: 12, d: 31 },
+        label: period,
+      };
+    }
+    match = /^(\d{4})-(\d{1,2})$/.exec(period);
+    if (match) {
+      const y = Number(match[1]);
+      const m = Number(match[2]);
+      if (m < 1 || m > 12)
+        throw new Error(`Period '${period}' has an invalid month.`);
+      const lastDay = new Date(y, m, 0).getDate();
+      return {
+        from: { y: y, m: m, d: 1 },
+        to: { y: y, m: m, d: lastDay },
+        label: `${y}-${String(m).padStart(2, "0")}`,
+      };
+    }
+    throw new Error(`Period '${period}' should be YYYY or YYYY-MM.`);
+  }
+
+  if (hasFrom !== hasTo)
+    throw new Error("Date From and Date To must be used together.");
+  if (!hasFrom) return null;
+
+  const from = toDateParts_(job.dateFrom, timeZone, "Date From");
+  const to = toDateParts_(job.dateTo, timeZone, "Date To");
+  const key = (p) => p.y * 10000 + p.m * 100 + p.d;
+  if (key(from) > key(to)) throw new Error("Date From is later than Date To.");
+  return {
+    from: from,
+    to: to,
+    label: `${formatDateParts_(from)}_to_${formatDateParts_(to)}`,
+  };
+}
+
+/**
+ * True if ANY line on the bill is tagged with the category and (if given) one
+ * of the options. Case and surrounding spaces are ignored.
+ * @param {Object} invoice - Xero invoice.
+ * @param {string} category - Tracking category name, or '' for no filter.
+ * @param {Array<string>} options - Tracking option names.
+ * @return {boolean} True if the bill should be kept.
+ */
+function passesTrackingFilter_(invoice, category, options) {
+  if (!category) return true;
+  const wantedCategory = normalise_(category);
+  const wantedOptions = new Set((options || []).map(normalise_));
+  return (invoice.LineItems || []).some((line) =>
+    (line.Tracking || []).some(
+      (t) =>
+        normalise_(t.Name) === wantedCategory &&
+        (!wantedOptions.size || wantedOptions.has(normalise_(t.Option))),
+    ),
+  );
+}
+
+/**
+ * Builds the A:J values for one bill.
+ * @param {string} entity - Entity key.
+ * @param {Object} invoice - Xero invoice.
+ * @return {Array} Row values.
+ */
+function buildBillRow_(entity, invoice) {
+  return [
+    entity,
+    formatXeroUtcTimestamp_(invoice.UpdatedDateUTC),
+    invoice.InvoiceID,
+    invoice.InvoiceNumber || "",
+    buildXeroDateOnly_(invoice.DateString, invoice.Date),
+    (invoice.Contact && invoice.Contact.Name) || "",
+    invoice.CurrencyCode || "",
+    Number(invoice.Total) || 0,
+    invoice.Status || "",
+    buildBillDescription_(invoice),
+  ];
+}
+
+/**
+ * Joins the bill's line-item descriptions (duplicates removed), one per line.
+ * @param {Object} invoice - Xero invoice.
+ * @return {string} Description text, trimmed to MAX_DESCRIPTION_CHARS.
+ */
+function buildBillDescription_(invoice) {
+  const descriptions = (invoice.LineItems || [])
+    .map((line) => String(line.Description || "").trim())
+    .filter((text) => text);
+  return [...new Set(descriptions)].join("\n").slice(0, MAX_DESCRIPTION_CHARS);
+}
+
+/**
+ * Appends bill rows, applying number formats first so IDs and invoice numbers stay text.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - ACCPAY Bills sheet.
+ * @param {Array<Array>} rows - Rows from buildBillRow_().
+ */
+function appendBillRows_(sheet, rows) {
+  if (!rows.length) return;
+  ensureRowCapacity_(sheet, rows.length);
+  const range = sheet.getRange(
+    sheet.getLastRow() + 1,
+    1,
+    rows.length,
+    BILL_DATA_COLUMN_COUNT,
+  );
+  range.setNumberFormats(rows.map(() => BILL_DATA_NUMBER_FORMATS));
+  range.setFontSize(STYLE.FONT_SIZE);
+  range.setValues(rows);
+}
+
+/**
+ * Reads the Invoice IDs already in a bills sheet (protects against duplicates on resume).
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - ACCPAY Bills sheet.
+ * @return {Set<string>} Invoice IDs.
+ */
+function readExistingInvoiceIds_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return new Set();
+  return new Set(
+    sheet
+      .getRange(2, BILL_COL.INVOICE_ID, lastRow - 1, 1)
+      .getValues()
+      .map((r) => String(r[0]))
+      .filter((id) => id),
+  );
+}
+
+/**
+ * Builds the bills file name, e.g. FOBE_xero_accpay_bills_2026-03_Project-A_20261002_101500.
+ * @param {string} entity - Entity key.
+ * @param {Object} filter - From buildJobFilter_().
+ * @return {string} File name.
+ */
+function buildBillsFileName_(entity, filter) {
+  const parts = [`${entity}_xero_accpay_bills`];
+  if (filter.periodLabel !== "All dates") parts.push(filter.periodLabel);
+  if (filter.trackingOptions.length) {
+    const tag = filter.trackingOptions
+      .map((o) => o.replace(/[^\w-]+/g, "-").replace(/^-+|-+$/g, ""))
+      .filter((o) => o)
+      .join("+");
+    if (tag) parts.push(tag.slice(0, 60));
+  } else if (filter.trackingCategory) {
+    parts.push(filter.trackingCategory.replace(/[^\w-]+/g, "-"));
+  }
+  parts.push(
+    Utilities.formatDate(
+      new Date(),
+      Session.getScriptTimeZone(),
+      "yyyyMMdd_HHmmss",
+    ),
+  );
+  return parts.join("_");
+}
+
+/**
+ * Creates a bills spreadsheet in the bills folder with the ACCPAY Bills and Job Info sheets.
+ * @param {Object} job - Job from readJobs_().
+ * @param {Object} filter - From buildJobFilter_().
+ * @param {Object} folders - From getWorkFolders_().
+ * @return {GoogleAppsScript.Spreadsheet.Spreadsheet} New spreadsheet.
+ */
+function createBillsSpreadsheet_(job, filter, folders) {
+  const ss = SpreadsheetApp.create(buildBillsFileName_(job.entity, filter));
+  moveFileToFolder_(ss.getId(), folders.bills);
+  ss.setSpreadsheetTimeZone(Session.getScriptTimeZone());
+
+  const billsSheet = ss.getSheets()[0];
+  billsSheet.setName(BILLS_SHEET_NAME);
+  applyStandardLayout_(billsSheet, BILL_HEADERS, BILL_COLUMN_WIDTHS);
+
+  const infoSheet = ss.insertSheet(JOB_INFO_SHEET_NAME);
+  applyStandardLayout_(infoSheet, ["Key", "Value"], [180, 500]);
+  const info = [
+    [JOB_INFO_KEY.ENTITY, job.entity],
+    [JOB_INFO_KEY.PERIOD, filter.periodLabel],
+    [JOB_INFO_KEY.TRACKING_CATEGORY, filter.trackingCategory],
+    [JOB_INFO_KEY.TRACKING_OPTIONS, filter.trackingOptions.join(", ")],
+    [JOB_INFO_KEY.XERO_FILTER, filter.whereClause],
+    [JOB_INFO_KEY.FILTER_FINGERPRINT, filter.fingerprint],
+    [JOB_INFO_KEY.CONTROL_SHEET, getControlSpreadsheet_().getUrl()],
+    [JOB_INFO_KEY.DOWNLOAD_STATUS, DOWNLOAD_STATUS.IN_PROGRESS],
+    [JOB_INFO_KEY.DOWNLOAD_STARTED, new Date()],
+  ];
+  const infoRange = infoSheet.getRange(2, 1, info.length, 2);
+  infoRange.setNumberFormat("@");
+  infoRange.setValues(
+    info.map(([k, v]) => [k, v instanceof Date ? v.toISOString() : String(v)]),
+  );
+  return ss;
+}
+
+/**
+ * Reads a bills file's Job Info sheet as a key/value object.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - Bills spreadsheet.
+ * @return {Object} Values keyed by JOB_INFO_KEY labels; {} if there's no Job Info sheet.
+ */
+function getJobInfo_(ss) {
+  const sheet = ss.getSheetByName(JOB_INFO_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return {};
+  return sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, 2)
+    .getValues()
+    .reduce((out, [key, value]) => {
+      if (key) out[String(key)] = String(value);
+      return out;
+    }, {});
+}
+
+/**
+ * Sets one Job Info value, adding the key if it isn't there yet.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - Bills spreadsheet.
+ * @param {string} key - A JOB_INFO_KEY label.
+ * @param {*} value - Value to store (Dates are stored as ISO text).
+ */
+function setJobInfo_(ss, key, value) {
+  const sheet = ss.getSheetByName(JOB_INFO_SHEET_NAME);
+  const text = value instanceof Date ? value.toISOString() : String(value);
+  const lastRow = sheet.getLastRow();
+  const keys =
+    lastRow >= 2
+      ? sheet
+          .getRange(2, 1, lastRow - 1, 1)
+          .getValues()
+          .map((r) => r[0])
+      : [];
+  const index = keys.indexOf(key);
+  const row = index === -1 ? lastRow + 1 : index + 2;
+  sheet
+    .getRange(row, 1, 1, 2)
+    .setNumberFormat("@")
+    .setFontSize(STYLE.FONT_SIZE)
+    .setValues([[key, text]]);
+}
